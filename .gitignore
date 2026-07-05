@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+
+# test/coverage output
+coverage/
+
+# logs
+*.log
+npm-debug.log*
+
+# editor/OS noise
+.DS_Store
+.idea/
+.vscode/
+
+# env/secrets
+.env
+.env.*
+
+# scratch
+*.tmp
+smoke*.mts

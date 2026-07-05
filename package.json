@@ -1,0 +1,30 @@
+{
+  "name": "herdr-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing Herdr (terminal agent orchestrator) to Claude via its Unix-socket JSON-RPC API",
+  "main": "dist/index.js",
+  "scripts": {
+    "test": "vitest run",
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "inspect": "npx @modelcontextprotocol/inspector npx tsx src/index.ts",
+    "lint": "biome check src test",
+    "format": "biome format --write src test",
+    "check": "npm run lint && npx tsc --noEmit && npm test"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.2",
+    "@types/node": "^26.1.0",
+    "tsx": "^4.23.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.9"
+  }
+}
