@@ -2,7 +2,7 @@ import { z } from "zod";
 
 /**
  * Wire types for Herdr's socket API (newline-delimited JSON-RPC over a Unix
- * domain socket). Shapes verified against Herdr 0.7.1, socket protocol 14.
+ * domain socket). Shapes verified against Herdr 0.9.1, socket protocol 22.
  */
 
 export interface HerdrRequest {
@@ -37,9 +37,19 @@ export function isHerdrResponse(value: unknown): value is HerdrResponse {
   return true;
 }
 
-/** A server-initiated line (event push): has a string `type`, no request id. */
+/**
+ * A server-initiated line (event push): no request id, and either a string
+ * `type` (pre-0.9 shape) or `event` (protocol 22 shape `{event, data}`).
+ * `event` is normalized onto `type` here so downstream consumers see one shape.
+ */
 export function isHerdrPush(value: unknown): value is HerdrPush {
-  return isRecord(value) && typeof value["type"] === "string";
+  if (!isRecord(value)) return false;
+  if (typeof value["type"] === "string") return true;
+  if (typeof value["event"] === "string") {
+    value["type"] = value["event"];
+    return true;
+  }
+  return false;
 }
 
 /** An error returned by the Herdr server (e.g. pane_not_found). */
@@ -56,7 +66,7 @@ export class HerdrError extends Error {
 // ---- result payload schemas (validated at the client boundary) ----
 // Herdr may add fields across versions; schemas are non-strict on purpose.
 
-export const AGENT_STATUSES = ["idle", "working", "blocked", "done"] as const;
+export const AGENT_STATUSES = ["idle", "working", "blocked", "done", "unknown"] as const;
 
 /** Known statuses plus room for values newer Herdr versions may add. */
 export const agentStatusSchema = z.string();
@@ -64,14 +74,16 @@ export type AgentStatus = z.infer<typeof agentStatusSchema>;
 
 export const rawAgentSchema = z.object({
   terminal_id: z.string(),
-  agent: z.string(),
+  // Absent while the pane's agent is still launching (launch_pending).
+  agent: z.string().optional(),
+  name: z.string().optional(),
   agent_status: agentStatusSchema,
   workspace_id: z.string(),
   tab_id: z.string(),
   pane_id: z.string(),
   focused: z.boolean(),
   cwd: z.string(),
-  foreground_cwd: z.string(),
+  foreground_cwd: z.string().optional(),
 });
 export type RawAgent = z.infer<typeof rawAgentSchema>;
 

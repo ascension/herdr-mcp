@@ -8,7 +8,10 @@ import type { LayoutNode, RawAgent, RawPane, RawTab, RawWorkspace, TabLayout } f
 export interface AgentView {
   /** Stable target handle (Herdr pane id, e.g. "w1:p1"). Pass to other tools. */
   agent_id: string;
+  /** Agent kind (claude, pi, …) or "unknown" while still launching. */
   agent: string;
+  /** Display name from agent.start (name defaults to kind). */
+  name?: string;
   status: string;
   workspace_id: string;
   tab_id: string;
@@ -19,7 +22,8 @@ export interface AgentView {
 export function shapeAgent(raw: RawAgent): AgentView {
   return {
     agent_id: raw.pane_id,
-    agent: raw.agent,
+    agent: raw.agent ?? "unknown",
+    ...(raw.name ? { name: raw.name } : {}),
     status: raw.agent_status,
     workspace_id: raw.workspace_id,
     tab_id: raw.tab_id,

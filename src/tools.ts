@@ -268,22 +268,34 @@ function registerActTools(server: McpServer, client: HerdrApi): void {
     {
       title: "Send input to a Herdr agent",
       description:
-        "Type text into a live agent's terminal. THIS ACTS on a real session — " +
-        "only target an agent_id observed via a recent list_agents call, and do not " +
-        "use it to answer questions about an agent (use read_pane for that). " +
-        "With submit=true the input is sent to the agent (trailing newline); with " +
-        "submit=false the text is typed but left unsubmitted for a human to review. " +
-        "Returns the pane's screen after sending so you can verify the effect.",
+        "Submit a prompt to a live agent, or type text into its terminal. " +
+        "THIS ACTS on a real session — only target an agent_id observed via a " +
+        "recent list_agents call, and do not use it to answer questions about an " +
+        "agent (use read_pane for that). With submit=true the prompt is delivered " +
+        "atomically (text + Enter as one operation) and the server refuses if the " +
+        "agent is blocked on input; wait_seconds makes it block until the agent " +
+        "settles. With submit=false the text is typed but left unsubmitted for a " +
+        "human to review. Returns the pane's screen afterwards so you can verify " +
+        "the effect.",
       inputSchema: {
         agent_id: z.string().describe('Target agent_id from list_agents (e.g. "w1:p1")'),
-        text: z.string().min(1).describe("The text to type, without a trailing newline"),
+        text: z.string().min(1).describe("The prompt text, without a trailing newline"),
         submit: z
           .boolean()
-          .describe("true: submit to the agent (appends newline); false: type only, leave un-submitted"),
+          .describe("true: submit the prompt (atomic, refuses blocked agents); false: type only, leave un-submitted"),
+        wait_seconds: z
+          .number()
+          .min(1)
+          .max(600)
+          .optional()
+          .describe(
+            "With submit=true only: block until the agent reaches idle/blocked/done " +
+              "or this many seconds pass",
+          ),
       },
       annotations: { readOnlyHint: false, destructiveHint: true },
     },
-    async ({ agent_id, text, submit }) => {
+    async ({ agent_id, text, submit, wait_seconds }) => {
       const agent = await resolveAgent(client, agent_id);
       if (!agent) {
         const known = (await client.listAgents()).map((a) => a.pane_id);
@@ -293,13 +305,23 @@ function registerActTools(server: McpServer, client: HerdrApi): void {
         );
       }
 
-      await client.sendText(agent_id, submit ? `${text}\n` : text);
+      if (submit) {
+        await client.call("agent.prompt", {
+          target: agent_id,
+          text,
+          ...(wait_seconds
+            ? { wait: { until: ["idle", "blocked", "done"], timeout_ms: wait_seconds * 1000 } }
+            : {}),
+        });
+      } else {
+        await client.sendText(agent_id, text);
+      }
 
       // Evidence over trust: show what actually landed in the pane.
       await new Promise((resolve) => setTimeout(resolve, SEND_EVIDENCE_DELAY_MS));
       const read = await client.readPane(agent_id, "visible", SEND_EVIDENCE_LINES);
       return ok(
-        `Sent to ${agent_id} (${agent.agent}, was ${agent.agent_status}; submit=${submit}).\n` +
+        `Sent to ${agent_id} (${agent.agent ?? "unknown"}, was ${agent.agent_status}; submit=${submit}).\n` +
           `Pane now shows:\n---\n${read.text}`,
       );
     },
@@ -336,22 +358,76 @@ function registerActTools(server: McpServer, client: HerdrApi): void {
     {
       title: "Start a new agent",
       description:
-        "Launch a coding agent (claude, codex, …) in a NEW pane split from the " +
-        "focused one. Returns the new agent's pane so you can immediately " +
+        "Launch a coding agent in Herdr. kind is a registered agent kind " +
+        '(claude, codex, devin, pi, grok, cursor, gemini, muse, aider, amp, …; ' +
+        "`herdr agent start --help` lists the live set). Without pane_id, a new " +
+        "shell pane is split off the focused pane — cwd and direction apply to " +
+        "the split — and the agent launches into it; pane_id targets an existing " +
+        "shell pane instead. Returns the new agent's pane so you can immediately " +
         "send_to_agent / wait_for_agent_status it.",
       inputSchema: {
-        name: z.string().describe('Agent name as configured in Herdr, e.g. "claude"'),
-        argv: z
-          .array(z.string())
-          .min(1)
-          .describe('Command line to run, e.g. ["claude"] or ["claude", "--continue"]'),
-        cwd: z.string().optional().describe("Working directory for the agent (defaults to Herdr's choice)"),
+        kind: z.string().describe('Agent kind registered in Herdr, e.g. "claude", "codex", "pi", "devin"'),
+        name: z.string().optional().describe("Display name for the agent (defaults to kind)"),
+        args: z.array(z.string()).optional().describe("Extra arguments for the agent command"),
+        pane_id: z
+          .string()
+          .optional()
+          .describe("Existing shell pane to launch into; omit to split a new pane"),
+        cwd: z.string().optional().describe("Working directory (only when splitting a new pane)"),
+        direction: z
+          .enum(["right", "down"])
+          .default("right")
+          .describe("Split direction (only when splitting a new pane)"),
+        timeout_seconds: z
+          .number()
+          .min(4)
+          .max(300)
+          .default(30)
+          .describe("How long Herdr waits for the pane to become a usable shell"),
       },
       annotations: { readOnlyHint: false, destructiveHint: false },
     },
-    async ({ name, argv, cwd }) => {
-      const result = await client.call("agent.start", { name, argv, ...(cwd ? { cwd } : {}) });
-      return ok(result);
+    async ({ kind, name, args, pane_id, cwd, direction, timeout_seconds }) => {
+      let target = pane_id;
+      if (!target) {
+        const split = await client.call("pane.split", { direction, ...(cwd ? { cwd } : {}) });
+        const pane = split["pane"];
+        const id =
+          typeof pane === "object" && pane !== null
+            ? (pane as Record<string, unknown>)["pane_id"]
+            : undefined;
+        if (typeof id !== "string") {
+          return fail(`pane.split returned no pane_id: ${JSON.stringify(split)}`);
+        }
+        target = id;
+      }
+      // A fresh split pane is not an "available shell" until its prompt is up;
+      // retry through that window, bounded by timeout_seconds.
+      const deadline = Date.now() + timeout_seconds * 1000;
+      try {
+        for (;;) {
+          try {
+            return ok(
+              await client.call("agent.start", {
+                name: name ?? kind,
+                kind,
+                pane_id: target,
+                timeout_ms: timeout_seconds * 1000,
+                ...(args?.length ? { args } : {}),
+              }),
+            );
+          } catch (error) {
+            const retryable =
+              error instanceof Error && /not an available shell/i.test(error.message);
+            if (!retryable || Date.now() >= deadline) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 400));
+          }
+        }
+      } catch (error) {
+        // Don't orphan the shell pane we split when the launch itself fails.
+        if (!pane_id) await client.call("pane.close", { pane_id: target }).catch(() => {});
+        throw error;
+      }
     },
   );
 
@@ -430,7 +506,7 @@ function registerActTools(server: McpServer, client: HerdrApi): void {
           const agent = await resolveAgent(client, pane_id);
           if (agent) {
             return fail(
-              `Refusing: pane ${pane_id} hosts a live ${agent.agent} agent ` +
+              `Refusing: pane ${pane_id} hosts a live ${agent.agent ?? "unknown"} agent ` +
                 `(${agent.agent_status}); closing it kills the session. If that is really ` +
                 "intended, ask the human or use herdr_rpc explicitly.",
             );

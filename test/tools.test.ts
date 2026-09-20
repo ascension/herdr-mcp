@@ -53,6 +53,8 @@ class FakeHerdr implements HerdrApi {
   layouts = new Map<string, TabLayout>();
   calls: Array<{ method: string; params: Record<string, unknown> }> = [];
   callResult: GenericResult = { type: "ok" };
+  callResults = new Map<string, GenericResult>();
+  callErrors = new Map<string, Error>();
 
   async listWorkspaces(): Promise<RawWorkspace[]> {
     return this.workspaces;
@@ -74,7 +76,9 @@ class FakeHerdr implements HerdrApi {
 
   async call(method: string, params: Record<string, unknown> = {}): Promise<GenericResult> {
     this.calls.push({ method, params });
-    return this.callResult;
+    const error = this.callErrors.get(method);
+    if (error) throw error;
+    return this.callResults.get(method) ?? this.callResult;
   }
 
   async readPane(paneId: string): Promise<PaneRead> {
@@ -178,7 +182,7 @@ describe("send_to_agent", () => {
     expect(herdr.sent).toEqual([]);
   });
 
-  it("appends a newline only when submit=true and returns pane evidence", async () => {
+  it("submits atomically via agent.prompt and types literally when submit=false", async () => {
     const herdr = new FakeHerdr();
     herdr.agents = [agent({ pane_id: "w1:p1" })];
     const client = await setup(herdr);
@@ -186,11 +190,90 @@ describe("send_to_agent", () => {
     await callTool(client, "send_to_agent", { agent_id: "w1:p1", text: "run tests", submit: true });
     await callTool(client, "send_to_agent", { agent_id: "w1:p1", text: "draft only", submit: false });
 
-    expect(herdr.sent).toEqual([
-      { paneId: "w1:p1", text: "run tests\n" },
-      { paneId: "w1:p1", text: "draft only" },
-    ]);
+    expect(herdr.calls).toContainEqual({
+      method: "agent.prompt",
+      params: { target: "w1:p1", text: "run tests" },
+    });
+    expect(herdr.sent).toEqual([{ paneId: "w1:p1", text: "draft only" }]);
   }, 10_000);
+
+  it("forwards wait_seconds to agent.prompt as a wait option", async () => {
+    const herdr = new FakeHerdr();
+    herdr.agents = [agent({ pane_id: "w1:p1" })];
+    const client = await setup(herdr);
+
+    await callTool(client, "send_to_agent", {
+      agent_id: "w1:p1",
+      text: "run tests",
+      submit: true,
+      wait_seconds: 30,
+    });
+
+    expect(herdr.calls).toContainEqual({
+      method: "agent.prompt",
+      params: {
+        target: "w1:p1",
+        text: "run tests",
+        wait: { until: ["idle", "blocked", "done"], timeout_ms: 30_000 },
+      },
+    });
+  }, 10_000);
+});
+
+describe("start_agent", () => {
+  it("splits a shell pane then starts the agent in it", async () => {
+    const herdr = new FakeHerdr();
+    herdr.callResults.set("pane.split", { type: "pane_info", pane: { pane_id: "w1:p9" } });
+    const client = await setup(herdr);
+
+    const result = await callTool(client, "start_agent", { kind: "pi", cwd: "/tmp" });
+
+    expect(result.isError).toBeUndefined();
+    expect(herdr.calls).toEqual([
+      { method: "pane.split", params: { direction: "right", cwd: "/tmp" } },
+      {
+        method: "agent.start",
+        params: { name: "pi", kind: "pi", pane_id: "w1:p9", timeout_ms: 30_000 },
+      },
+    ]);
+  });
+
+  it("uses a caller-provided pane_id without splitting", async () => {
+    const herdr = new FakeHerdr();
+    const client = await setup(herdr);
+
+    await callTool(client, "start_agent", {
+      kind: "claude",
+      name: "reviewer",
+      pane_id: "w1:p2",
+      args: ["--continue"],
+    });
+
+    expect(herdr.calls).toEqual([
+      {
+        method: "agent.start",
+        params: {
+          name: "reviewer",
+          kind: "claude",
+          pane_id: "w1:p2",
+          timeout_ms: 30_000,
+          args: ["--continue"],
+        },
+      },
+    ]);
+  });
+
+  it("closes the split pane when agent.start fails", async () => {
+    const herdr = new FakeHerdr();
+    herdr.callResults.set("pane.split", { type: "pane_info", pane: { pane_id: "w1:p9" } });
+    herdr.callErrors.set("agent.start", new Error("unknown agent kind"));
+    const client = await setup(herdr);
+
+    const result = await callTool(client, "start_agent", { kind: "nope" });
+
+    expect(result.isError).toBe(true);
+    expect(herdr.calls).toContainEqual({ method: "pane.close", params: { pane_id: "w1:p9" } });
+  });
 });
 
 function populateLayout(herdr: FakeHerdr): void {
