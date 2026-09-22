@@ -25,13 +25,31 @@ console.log("started:", paneId, "argv:", started.argv);
 await call("wait_for_agent_status", { agent_id: paneId, until: ["idle"], timeout_seconds: 60 });
 console.log("idle");
 
-const promptRes = await call("send_to_agent", {
+// Submit without waiting, then wait mid-work — the transition can only be
+// observed via the events.subscribe stream, not the initial status check.
+await call("send_to_agent", {
   agent_id: paneId,
   text: "Reply with exactly LIVE-SMOKE-OK and nothing else.",
   submit: true,
-  wait_seconds: 120,
 });
-console.log("prompt done");
+console.log("prompt sent");
+
+const waited = JSON.parse(
+  await call("wait_for_agent_status", {
+    agent_id: paneId,
+    until: ["idle", "blocked", "done"],
+    timeout_seconds: 120,
+  }),
+);
+console.log("settled:", waited.status, "waited:", waited.waited);
+
+const promptRes = await call("send_to_agent", {
+  agent_id: paneId,
+  text: "Confirm: say OK.",
+  submit: true,
+  wait_seconds: 60,
+});
+console.log("prompt+wait done");
 
 const out = await call("read_pane", { pane_id: paneId, source: "recent", lines: 40 });
 console.log("token seen:", out.includes("LIVE-SMOKE-OK"));

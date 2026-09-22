@@ -1,6 +1,6 @@
 import net from "node:net";
 import readline from "node:readline";
-import { HerdrError, type HerdrPush, isHerdrPush, isHerdrResponse } from "./protocol.js";
+import { HerdrError, type HerdrPush, isHerdrPush, isHerdrResponse, pushType } from "./protocol.js";
 
 export type Logger = (message: string) => void;
 
@@ -69,8 +69,13 @@ export class HerdrConnection {
       this.pending.set(id, { resolve, reject });
       // A write error (e.g. EPIPE on a half-closed socket) must reject this
       // request; the socket's error event then tears down the rest.
+      // Tag it `unsent`: a truncated NDJSON line can never be processed, so the
+      // client may safely re-issue even a non-idempotent request.
       socket.write(`${line}\n`, (error) => {
-        if (error && this.pending.delete(id)) reject(error);
+        if (error && this.pending.delete(id)) {
+          (error as Error & { unsent?: boolean }).unsent = true;
+          reject(error);
+        }
       });
     });
   }
@@ -112,7 +117,9 @@ export class HerdrConnection {
     }
 
     // Not a reply to anything we sent — treat it as a server push (event).
+    // Protocol 22 pushes carry `event`; normalize so consumers see `type`.
     if (isHerdrPush(msg)) {
+      msg.type = pushType(msg);
       this.onPush?.(msg);
     } else {
       this.log(`herdr: dropping unrecognized line: ${line.slice(0, 200)}`);

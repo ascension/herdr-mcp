@@ -305,14 +305,27 @@ function registerActTools(server: McpServer, client: HerdrApi): void {
         );
       }
 
+      let settleNote = "";
       if (submit) {
-        await client.call("agent.prompt", {
-          target: agent_id,
-          text,
-          ...(wait_seconds
-            ? { wait: { until: ["idle", "blocked", "done"], timeout_ms: wait_seconds * 1000 } }
-            : {}),
-        });
+        const params: Record<string, unknown> = { target: agent_id, text };
+        if (wait_seconds) {
+          params["wait"] = { until: ["idle", "blocked", "done"], timeout_ms: wait_seconds * 1000 };
+        }
+        if (wait_seconds) {
+          // Long-poll on its own connection, plus a client-side guard: if the
+          // server misses the deadline the tool still returns. The prompt was
+          // already delivered — a race timeout must read as sent-but-unsettled,
+          // not as an error that invites a duplicate send.
+          const request = client.call("agent.prompt", params, { dedicated: true });
+          const guard = new Promise<"timeout">((resolve) =>
+            setTimeout(() => resolve("timeout"), wait_seconds * 1000 + 500),
+          );
+          if ((await Promise.race([request, guard])) === "timeout") {
+            settleNote = ` Prompt delivered; agent did not reach idle/blocked/done within ${wait_seconds}s.`;
+          }
+        } else {
+          await client.call("agent.prompt", params);
+        }
       } else {
         await client.sendText(agent_id, text);
       }
@@ -321,7 +334,7 @@ function registerActTools(server: McpServer, client: HerdrApi): void {
       await new Promise((resolve) => setTimeout(resolve, SEND_EVIDENCE_DELAY_MS));
       const read = await client.readPane(agent_id, "visible", SEND_EVIDENCE_LINES);
       return ok(
-        `Sent to ${agent_id} (${agent.agent ?? "unknown"}, was ${agent.agent_status}; submit=${submit}).\n` +
+        `Sent to ${agent_id} (${agent.agent ?? "unknown"}, was ${agent.agent_status}; submit=${submit}).${settleNote}\n` +
           `Pane now shows:\n---\n${read.text}`,
       );
     },
@@ -402,20 +415,32 @@ function registerActTools(server: McpServer, client: HerdrApi): void {
         target = id;
       }
       // A fresh split pane is not an "available shell" until its prompt is up;
-      // retry through that window, bounded by timeout_seconds.
+      // retry through that window, bounded by timeout_seconds. Each attempt
+      // runs on a dedicated connection (server-side waits must not stall the
+      // shared queue) with a client-side guard in case timeout_ms is ignored.
       const deadline = Date.now() + timeout_seconds * 1000;
       try {
         for (;;) {
           try {
-            return ok(
-              await client.call("agent.start", {
+            const request = client.call(
+              "agent.start",
+              {
                 name: name ?? kind,
                 kind,
                 pane_id: target,
                 timeout_ms: timeout_seconds * 1000,
                 ...(args?.length ? { args } : {}),
-              }),
+              },
+              { dedicated: true },
             );
+            const guard = new Promise<"timeout">((resolve) =>
+              setTimeout(() => resolve("timeout"), timeout_seconds * 1000 + 500),
+            );
+            const result = await Promise.race([request, guard]);
+            if (result === "timeout") {
+              throw new Error(`agent.start did not answer within ${timeout_seconds}s`);
+            }
+            return ok(result);
           } catch (error) {
             const retryable =
               error instanceof Error && /not an available shell/i.test(error.message);
@@ -424,8 +449,12 @@ function registerActTools(server: McpServer, client: HerdrApi): void {
           }
         }
       } catch (error) {
-        // Don't orphan the shell pane we split when the launch itself fails.
-        if (!pane_id) await client.call("pane.close", { pane_id: target }).catch(() => {});
+        // Don't orphan the shell pane we split — unless an agent landed in it
+        // anyway (a lost reply can hide a successful start).
+        if (!pane_id) {
+          const hosted = await resolveAgent(client, target).catch(() => undefined);
+          if (!hosted) await client.call("pane.close", { pane_id: target }).catch(() => {});
+        }
         throw error;
       }
     },

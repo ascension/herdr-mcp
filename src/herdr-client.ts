@@ -81,19 +81,28 @@ export class HerdrClient implements HerdrApi {
   }
 
   /**
-   * Herdr (0.7.1) closes the connection after replying, which makes
-   * concurrent requests on one connection impossible — so requests are
-   * serialized through a queue, and a request that still raced a close is
+   * Herdr closes the connection after replying (observed on 0.7.x and 0.9.1),
+   * which makes concurrent requests on one connection impossible — so requests
+   * are serialized through a queue, and a request that still raced a close is
    * retried once on a fresh connection. HerdrErrors are real server answers
-   * and are never retried.
+   * and are never retried. `noRetry` is for non-idempotent methods: a request
+   * lost after the server processed it must not be re-issued.
    */
-  request(method: string, params: Record<string, unknown> = {}): Promise<unknown> {
+  request(
+    method: string,
+    params: Record<string, unknown> = {},
+    opts: { noRetry?: boolean } = {},
+  ): Promise<unknown> {
     const run = async (): Promise<unknown> => {
       try {
         const connection = await this.ensureConnection();
         return await connection.request(method, params);
       } catch (error) {
         if (error instanceof HerdrError) throw error;
+        // `unsent` marks a write that provably never reached the server — safe
+        // to re-issue even when the method mutates.
+        const unsent = (error as { unsent?: boolean }).unsent === true;
+        if (opts.noRetry && !unsent) throw error;
         const connection = await this.ensureConnection();
         return connection.request(method, params);
       }
@@ -142,6 +151,8 @@ export class HerdrClient implements HerdrApi {
     opts: { dedicated?: boolean } = {},
   ): Promise<GenericResult> {
     if (opts.dedicated) {
+      // Long-poll (agent.prompt --wait, agent.start, pane.wait_for_output) runs
+      // on its own connection so it cannot stall the serialized request queue.
       const connection = new HerdrConnection(this.socketPath, this.log);
       await connection.connect();
       try {
@@ -151,7 +162,10 @@ export class HerdrClient implements HerdrApi {
         connection.close();
       }
     }
-    const res = await this.request(method, params);
+    // Everything routed through call() is at-most-once: the callers are
+    // mutating methods, and a request lost after the server acted on it must
+    // not be silently re-issued.
+    const res = await this.request(method, params, { noRetry: true });
     return parseResult(method, genericResultSchema, res);
   }
 
@@ -161,7 +175,7 @@ export class HerdrClient implements HerdrApi {
   }
 
   async sendText(paneId: string, text: string): Promise<void> {
-    await this.request("pane.send_text", { pane_id: paneId, text });
+    await this.request("pane.send_text", { pane_id: paneId, text }, { noRetry: true });
   }
 
   /**

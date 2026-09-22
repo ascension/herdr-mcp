@@ -40,16 +40,20 @@ export function isHerdrResponse(value: unknown): value is HerdrResponse {
 /**
  * A server-initiated line (event push): no request id, and either a string
  * `type` (pre-0.9 shape) or `event` (protocol 22 shape `{event, data}`).
- * `event` is normalized onto `type` here so downstream consumers see one shape.
  */
 export function isHerdrPush(value: unknown): value is HerdrPush {
-  if (!isRecord(value)) return false;
-  if (typeof value["type"] === "string") return true;
-  if (typeof value["event"] === "string") {
-    value["type"] = value["event"];
-    return true;
-  }
-  return false;
+  return (
+    isRecord(value) &&
+    (typeof value["type"] === "string" || typeof value["event"] === "string")
+  );
+}
+
+/** Normalize a protocol-22 `{event, data}` push onto `type` for consumers. */
+export function pushType(push: HerdrPush): string {
+  const type = push["type"];
+  if (typeof type === "string") return type;
+  const event = push["event"];
+  return typeof event === "string" ? event : "unknown";
 }
 
 /** An error returned by the Herdr server (e.g. pane_not_found). */

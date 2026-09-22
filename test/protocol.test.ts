@@ -5,6 +5,7 @@ import {
   isHerdrPush,
   isHerdrResponse,
   parseResult,
+  pushType,
 } from "../src/protocol.js";
 
 describe("isHerdrResponse", () => {
@@ -33,10 +34,28 @@ describe("isHerdrPush", () => {
     expect(isHerdrPush({ type: "pane.agent_status_changed", pane_id: "w1:p1" })).toBe(true);
   });
 
+  it("accepts protocol-22 {event, data} pushes", () => {
+    expect(
+      isHerdrPush({ event: "pane.agent_status_changed", data: { pane_id: "w1:p1" } }),
+    ).toBe(true);
+  });
+
+  it("does not classify a response carrying an event field as a push", () => {
+    const line = { id: "req_1", result: { type: "ok" }, event: "x" };
+    expect(isHerdrResponse(line)).toBe(true);
+  });
+
   it("rejects everything else", () => {
     expect(isHerdrPush({ id: "1" })).toBe(false);
     expect(isHerdrPush([])).toBe(false);
     expect(isHerdrPush(undefined)).toBe(false);
+  });
+});
+
+describe("pushType", () => {
+  it("reads type and normalizes event", () => {
+    expect(pushType({ type: "pane.closed" })).toBe("pane.closed");
+    expect(pushType({ event: "pane.closed", data: {} })).toBe("pane.closed");
   });
 });
 

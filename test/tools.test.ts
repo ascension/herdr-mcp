@@ -55,6 +55,8 @@ class FakeHerdr implements HerdrApi {
   callResult: GenericResult = { type: "ok" };
   callResults = new Map<string, GenericResult>();
   callErrors = new Map<string, Error>();
+  /** Per-attempt script: each call to the method shifts the next step. */
+  callScript = new Map<string, Array<GenericResult | Error>>();
 
   async listWorkspaces(): Promise<RawWorkspace[]> {
     return this.workspaces;
@@ -76,6 +78,12 @@ class FakeHerdr implements HerdrApi {
 
   async call(method: string, params: Record<string, unknown> = {}): Promise<GenericResult> {
     this.calls.push({ method, params });
+    const scripted = this.callScript.get(method);
+    if (scripted?.length) {
+      const step = scripted.shift();
+      if (step instanceof Error) throw step;
+      if (step) return step;
+    }
     const error = this.callErrors.get(method);
     if (error) throw error;
     return this.callResults.get(method) ?? this.callResult;
@@ -263,17 +271,48 @@ describe("start_agent", () => {
     ]);
   });
 
-  it("closes the split pane when agent.start fails", async () => {
+  it("retries through the shell-readiness window", async () => {
     const herdr = new FakeHerdr();
-    herdr.callResults.set("pane.split", { type: "pane_info", pane: { pane_id: "w1:p9" } });
-    herdr.callErrors.set("agent.start", new Error("unknown agent kind"));
+    herdr.callScript.set("pane.split", [{ type: "pane_info", pane: { pane_id: "w1:p9" } }]);
+    herdr.callScript.set("agent.start", [
+      new Error("agent target pane w1:p9 is not an available shell"),
+      { type: "agent_started", agent: { pane_id: "w1:p9" } },
+    ]);
+    const client = await setup(herdr);
+
+    const result = await callTool(client, "start_agent", { kind: "pi" });
+
+    expect(result.isError).toBeUndefined();
+    expect(herdr.calls.filter((c) => c.method === "agent.start")).toHaveLength(2);
+  }, 10_000);
+
+  it("does not retry a non-shell error and cleans up the split pane", async () => {
+    const herdr = new FakeHerdr();
+    herdr.callScript.set("pane.split", [{ type: "pane_info", pane: { pane_id: "w1:p9" } }]);
+    herdr.callScript.set("agent.start", [new Error("unknown agent kind")]);
     const client = await setup(herdr);
 
     const result = await callTool(client, "start_agent", { kind: "nope" });
 
     expect(result.isError).toBe(true);
+    expect(herdr.calls.filter((c) => c.method === "agent.start")).toHaveLength(1);
     expect(herdr.calls).toContainEqual({ method: "pane.close", params: { pane_id: "w1:p9" } });
-  });
+  }, 10_000);
+
+  it("does not close the pane when an agent landed despite the failed call", async () => {
+    const herdr = new FakeHerdr();
+    herdr.callScript.set("pane.split", [{ type: "pane_info", pane: { pane_id: "w1:p9" } }]);
+    herdr.callErrors.set("agent.start", new Error("connection lost"));
+    // The lost reply hid a successful start: the pane now hosts a live agent.
+    herdr.agents = [agent({ pane_id: "w1:p9", agent_status: "idle" })];
+    const client = await setup(herdr);
+
+    const result = await callTool(client, "start_agent", { kind: "pi" });
+
+    expect(result.isError).toBe(true);
+    expect(herdr.calls.find((c) => c.method === "pane.close")).toBeUndefined();
+  }, 10_000);
+
 });
 
 function populateLayout(herdr: FakeHerdr): void {
